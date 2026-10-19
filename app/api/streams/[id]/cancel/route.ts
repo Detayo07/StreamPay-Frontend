@@ -10,6 +10,9 @@
  *   recipient_payout + sender_refund === total_amount - released_amount
  *
  * The stream escrow is fully drained — no dust remains after cancellation.
+ * Amounts come from the persisted stream record. Linear vesting is evaluated
+ * at cancellation time; missing or malformed escrow data returns 422
+ * ESCROW_STATE_UNAVAILABLE without changing the stream.
  *
  * ## Authorization
  * Either the stream sender (identified by `Actor-Wallet-Address` header
@@ -44,6 +47,7 @@ import {
   computeCancellationSplit,
   buildCancellationRecord,
 } from "@/app/lib/cancel-stream";
+import { escrowNow, resolveEscrowState } from "@/app/lib/escrow-state";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -65,24 +69,6 @@ function getRequestUrl(req: Request, fallback: string): URL {
   } catch {
     return new URL(`http://localhost${fallback}`);
   }
-}
-
-// ── Mock escrow-state resolver ────────────────────────────────────────────────
-// In production this would query the Soroban contract storage for the stream's
-// current vested_amount, released_amount, and total_amount.
-// Amounts are i128 raw units — no per-decimal logic here.
-function resolveEscrowState(streamId: string): {
-  totalAmount: bigint;
-  releasedAmount: bigint;
-  vestedAmount: bigint;
-} {
-  // Mock: use deterministic values keyed by stream ID for testability.
-  // Replace with real Soroban RPC call in production.
-  const mockEscrow: Record<string, { totalAmount: bigint; releasedAmount: bigint; vestedAmount: bigint }> = {
-    "stream-ada":  { totalAmount: 3_600_000_000n, releasedAmount: 1_200_000_000n, vestedAmount: 1_800_000_000n },
-    "stream-kemi": { totalAmount: 1_280_000_000n, releasedAmount: 0n,             vestedAmount: 0n             },
-  };
-  return mockEscrow[streamId] ?? { totalAmount: 1_000_000_000n, releasedAmount: 0n, vestedAmount: 500_000_000n };
 }
 
 // ── Route handler ─────────────────────────────────────────────────────────────
@@ -183,15 +169,33 @@ export async function POST(
       }
     }
 
+    // Preserve the terminal/draft guards even for older records whose escrow
+    // fields are absent. No balance lookup is needed for an ineligible stream.
+    if (["cancelled", "ended", "withdrawn"].includes(stream.status)) {
+      return createErrorResponse("ALREADY_TERMINAL", `Stream is already in terminal state '${stream.status}' and cannot be cancelled. Double-cancel rejected.`, 409);
+    }
+    if (stream.status === "draft") {
+      return createErrorResponse("STREAM_NOT_CANCELLABLE", "Draft streams have no escrowed funds. Start the stream before cancelling.", 422);
+    }
+
     // ── Resolve escrow state ──────────────────────────────────────────────────
-    const escrow = resolveEscrowState(id);
+    const now = escrowNow();
+    const escrowResult = resolveEscrowState(stream, now);
+    if (!escrowResult.ok) {
+      return createErrorResponse(
+        "ESCROW_STATE_UNAVAILABLE",
+        "The stream's persisted escrow amounts or vesting schedule are unavailable.",
+        422,
+      );
+    }
+    const escrow = escrowResult.value;
     const token  = stream.token ?? "XLM";
 
     // ── Compute split ─────────────────────────────────────────────────────────
     const cancelResult = computeCancellationSplit(stream, {
-      totalAmount:      escrow.totalAmount,
-      releasedAmount:   escrow.releasedAmount,
-      vestedAmount:     escrow.vestedAmount,
+      totalAmount:      escrow.total,
+      releasedAmount:   escrow.released,
+      vestedAmount:     escrow.vested,
       token,
       senderAddress:    stream.senderAddress ?? actorAddress ?? "unknown",
       recipientAddress: stream.recipient,
@@ -215,9 +219,9 @@ export async function POST(
     // ── Build cancellation record ─────────────────────────────────────────────
     const cancellation = buildCancellationRecord(
       {
-        totalAmount:      escrow.totalAmount,
-        releasedAmount:   escrow.releasedAmount,
-        vestedAmount:     escrow.vestedAmount,
+        totalAmount:      escrow.total,
+        releasedAmount:   escrow.released,
+        vestedAmount:     escrow.vested,
         token,
         senderAddress:    stream.senderAddress ?? actorAddress ?? "unknown",
         recipientAddress: stream.recipient,
@@ -229,15 +233,14 @@ export async function POST(
 
     // ── Persist updated stream ────────────────────────────────────────────────
     const before = structuredClone(stream);
-    const now    = new Date().toISOString();
     const updatedStream = {
       ...stream,
       status:         "cancelled" as const,
       nextAction:     undefined,
-      updatedAt:      now,
+      updatedAt:      now.toISOString(),
       // Advance released_amount to vested_amount — escrow fully drained.
-      releasedAmount: escrow.vestedAmount.toString(),
-      vestedAmount:   escrow.vestedAmount.toString(),
+      releasedAmount: escrow.vested.toString(),
+      vestedAmount:   escrow.vested.toString(),
       cancellation,
     };
     db.streams.set(id, updatedStream);

@@ -46,6 +46,10 @@ const demoDate = makeDemoDateShifter("2026-04-28T12:00:00Z");
     label: "Design Retainer Q2",
     partnerId: "PARTNER-FIXTURE-1", // synthetic partner id
     token: "XLM",
+    totalAmount: "3600000000",
+    vestedAmount: "1800000000",
+    releasedAmount: "1200000000",
+    senderAddress: "GSENDER00000000000000000000000000000000000000000000",
   },
   {
     id: "stream-kemi",

@@ -214,11 +214,14 @@ async function handleStreamsPost(request: Request) {
       );
     }
 
-    const { rate, recipient, schedule, token: rawToken } = body as {
+    const { rate, recipient, schedule, token: rawToken, totalAmount, startTime, endTime } = body as {
       rate?: string;
       recipient?: string;
       schedule?: string;
       token?: string;
+      totalAmount?: string;
+      startTime?: string;
+      endTime?: string;
     };
 
     const rateValue = rate ?? "";
@@ -253,6 +256,8 @@ async function handleStreamsPost(request: Request) {
       status: "draft",
       updatedAt: now,
       token: normalisedToken,
+      ...(totalAmount === undefined ? {} : { totalAmount, releasedAmount: "0", vestedAmount: "0" }),
+      ...(startTime === undefined ? {} : { startTime, endTime }),
     };
 
     streamRepository.streams.set(id, newStream);

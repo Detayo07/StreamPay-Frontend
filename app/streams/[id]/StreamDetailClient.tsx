@@ -16,7 +16,6 @@ import { fetchWithIdempotency } from "../../../lib/apiClient";
 import { isStreamPayError, normalizeError } from "../../lib/errors";
 import type { StreamPayError } from "../../lib/errors";
 import { exportStreamVestingAsIcs } from "../../utils/ics";
-import type { CancelInput } from "../../lib/cancel-stream";
 
 type StreamDetailClientProps = {
   stream: Stream;
@@ -474,15 +473,7 @@ export function StreamDetailClient({
           isOpen={isDestructiveOpen}
           onClose={() => setIsDestructiveOpen(false)}
           onConfirm={handleDestructiveAction}
-          stream={{ status: stream.status }}
-          split={{
-            totalAmount: BigInt(stream.totalAmount ?? "0"),
-            releasedAmount: BigInt(stream.releasedAmount ?? "0"),
-            vestedAmount: BigInt(stream.vestedAmount ?? "0"),
-            token: stream.token ?? "XLM",
-            senderAddress: stream.senderAddress ?? "",
-            recipientAddress: stream.recipient,
-          }}
+          stream={stream}
           tokenLabel={stream.token ?? "XLM"}
         />
       )}
