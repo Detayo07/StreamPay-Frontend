@@ -1,6 +1,6 @@
 import fc from "fast-check";
 import { computeCancellationSplit } from "./cancel-stream";
-import { escrowNow, resolveEscrowState } from "./escrow-state";
+import { escrowNow, resolveEscrowState, vestedAmount } from "./escrow-state";
 import type { Stream } from "@/app/types/openapi";
 
 const start = "2026-01-01T00:00:00.000Z";
@@ -113,5 +113,41 @@ describe("resolveEscrowState", () => {
           .toBe(total - released);
       },
     ));
+  });
+});
+
+describe("contract-style vestedAmount compatibility", () => {
+  const timed = { ...base, total: "200", startTime: "0", endTime: "100", totalPausedMs: "0" };
+
+  it("handles draft, active, paused and completed windows with integer arithmetic", () => {
+    expect(vestedAmount({ ...timed, status: "draft" }, 50)).toEqual({ ok: true, value: 0n });
+    expect(vestedAmount(timed, 25n)).toEqual({ ok: true, value: 50n });
+    expect(vestedAmount(timed, -1)).toEqual({ ok: true, value: 0n });
+    expect(vestedAmount(timed, 101)).toEqual({ ok: true, value: 200n });
+    expect(vestedAmount({ ...timed, pausedAt: "20" }, 50)).toEqual({ ok: true, value: 40n });
+    expect(vestedAmount({ ...timed, totalPausedMs: "10" }, 50)).toEqual({ ok: true, value: 80n });
+    expect(vestedAmount({ ...timed, totalPausedMs: "60" }, 50)).toEqual({ ok: true, value: 0n });
+    expect(vestedAmount({ ...timed, totalPausedMs: "-10" }, 100)).toEqual({ ok: true, value: 200n });
+    expect(vestedAmount({ ...timed, endTime: "0" }, 50)).toEqual({ ok: true, value: 0n });
+  });
+
+  it("accepts integer timing representations and rejects unknown schedules", () => {
+    expect(vestedAmount({ ...timed, total: 200n, startTime: " 0 ", endTime: "100" }, 50))
+      .toEqual({ ok: true, value: 100n });
+    expect(vestedAmount({ ...timed, total: 200, startTime: 0, endTime: 100 }, 50))
+      .toEqual({ ok: true, value: 100n });
+    for (const change of [
+      { total: undefined },
+      { startTime: undefined },
+      { endTime: undefined },
+      { endTime: "" },
+      { endTime: "bad" },
+      { endTime: Number.NaN },
+      { endTime: 1.5 },
+      { endTime: null },
+    ]) {
+      expect(vestedAmount({ ...timed, ...change } as typeof timed, 50))
+        .toEqual({ ok: false, code: "ESCROW_UNKNOWN" });
+    }
   });
 });

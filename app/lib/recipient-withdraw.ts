@@ -217,6 +217,74 @@ export function computeWithdraw(
   };
 }
 
-// Kept as a re-export for callers of the withdrawal module; the implementation
-// is shared with cancellation so the two operations cannot disagree.
+// ── Vesting (bit-exact port of release::vested_amount) ────────────────────────
+
+/** Sentinel thrown/returned when a stream lacks the timing fields needed to vest. */
+export const ESCROW_UNKNOWN = "ESCROW_UNKNOWN";
+
+/**
+ * Compute the vested amount for a stream at `nowMs`, matching the Soroban
+ * contract's `release::vested_amount` exactly.
+ *
+ * Contract semantics (release.rs):
+ *   - Draft streams vest 0.
+ *   - effective_now = max(start, min(now, end)), clamped to paused_at when paused.
+ *   - elapsed = effective_now - start - total_paused_duration.
+ *   - vested = total * elapsed / duration  (integer division).
+ *
+ * All arithmetic is bigint — no floating point.
+ *
+ * @throws Error(ESCROW_UNKNOWN) when startTime/endTime are missing.
+ */
+export function vestedAmount(stream: Stream, nowMs: number): bigint {
+  const s = stream as any;
+
+  if (s.status === "draft") {
+    return 0n;
+  }
+
+  const startRaw = s.startTime as string | number | undefined;
+  const endRaw   = s.endTime   as string | number | undefined;
+  if (startRaw === undefined || startRaw === null || endRaw === undefined || endRaw === null) {
+    throw new Error(ESCROW_UNKNOWN);
+  }
+
+  const start = BigInt(startRaw);
+  const end   = BigInt(endRaw);
+  const total = BigInt((s.totalAmount as string | undefined) ?? "0");
+
+  if (end <= start) {
+    return 0n;
+  }
+
+  const duration = end - start;
+
+  const pausedAtRaw = s.pausedAt as string | number | undefined;
+  const isPaused = pausedAtRaw !== undefined && pausedAtRaw !== null && pausedAtRaw !== "";
+  const pausedAt = isPaused ? BigInt(pausedAtRaw as string | number) : 0n;
+
+  const totalPausedMs = BigInt((s.totalPausedMs as string | number | undefined) ?? 0);
+
+  const now = BigInt(nowMs);
+
+  // effective_now = max(start, min(now, end)), clamped to paused_at when paused.
+  let effectiveNow = now < start ? start : now > end ? end : now;
+  if (isPaused && pausedAt < effectiveNow) {
+    effectiveNow = pausedAt;
+  }
+
+  // elapsed = effective_now - start - total_paused_duration (floored at 0).
+  let elapsed = effectiveNow - start - totalPausedMs;
+  if (elapsed < 0n) {
+    elapsed = 0n;
+  }
+  if (elapsed > duration) {
+    elapsed = duration;
+  }
+
+  // vested = total * elapsed / duration  (integer division).
+  return (total * elapsed) / duration;
+}
+
+// Keep the withdrawal module's resolver import path stable for callers.
 export { resolveEscrowState } from "./escrow-state";

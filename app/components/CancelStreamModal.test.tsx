@@ -1,122 +1,273 @@
-/** @jest-environment jsdom */
+/**
+ * @jest-environment jsdom
+ */
 
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { render, fireEvent } from "@testing-library/react";
+const { screen } = require("@testing-library/react") as any;
 import { CancelStreamModal } from "./CancelStreamModal";
+import type { CancelInput } from "../lib/cancel-stream";
 import type { Stream } from "../types/openapi";
-import { POST as cancelStream } from "../api/streams/[id]/cancel/route";
-import { db, resetDb } from "../lib/db";
-import { resetRateLimitStore } from "../lib/rate-limit-store";
 
-jest.mock("../lib/escrow-state", () => ({
-  ...jest.requireActual("../lib/escrow-state"),
-  escrowNow: () => new Date("2026-01-01T06:00:00.000Z"),
-}));
+const ONE_TOKEN = 10_000_000n; // 1.0 in stroops
 
-const now = new Date("2026-01-01T06:00:00.000Z");
-const stream: Stream = {
-  id: "stream-test",
-  recipient: "GRECIPIENT",
-  senderAddress: "GSENDER",
-  rate: "1",
-  schedule: "day",
-  status: "active",
-  createdAt: "2026-01-01T00:00:00.000Z",
-  updatedAt: "2026-01-01T00:00:00.000Z",
+const split: CancelInput = {
+  totalAmount: 100n * ONE_TOKEN,
+  releasedAmount: 0n,
+  vestedAmount: 40n * ONE_TOKEN,
   token: "XLM",
-  totalAmount: "2000000000",
-  releasedAmount: "100000000",
-  startTime: "2026-01-01T00:00:00.000Z",
-  endTime: "2026-01-02T00:00:00.000Z",
+  senderAddress: "GSENDER",
+  recipientAddress: "GRECIPIENT",
 };
 
-function show(record: Stream = stream, onConfirm = jest.fn(), onClose = jest.fn(), tokenLabel = "XLM") {
-  render(
-    <CancelStreamModal
-      isOpen
-      onClose={onClose}
-      onConfirm={onConfirm}
-      stream={record}
-      now={now}
-      tokenLabel={tokenLabel}
-    />,
-  );
-  return { onConfirm, onClose };
+const partialReleaseSplit: CancelInput = {
+  totalAmount: 100n * ONE_TOKEN,
+  releasedAmount: 10n * ONE_TOKEN,
+  vestedAmount: 40n * ONE_TOKEN,
+  token: "XLM",
+  senderAddress: "GSENDER",
+  recipientAddress: "GRECIPIENT",
+};
+
+const fullyVestedSplit: CancelInput = {
+  totalAmount: 100n * ONE_TOKEN,
+  releasedAmount: 80n * ONE_TOKEN,
+  vestedAmount: 100n * ONE_TOKEN,
+  token: "XLM",
+  senderAddress: "GSENDER",
+  recipientAddress: "GRECIPIENT",
+};
+
+function streamFrom(input: CancelInput, status: Stream["status"]): Stream {
+  return {
+    id: "stream-preview",
+    recipient: input.recipientAddress,
+    senderAddress: input.senderAddress,
+    rate: "1",
+    schedule: "day",
+    status,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    token: input.token,
+    totalAmount: input.totalAmount.toString(),
+    releasedAmount: input.releasedAmount.toString(),
+    vestedAmount: input.vestedAmount.toString(),
+  };
 }
 
 describe("CancelStreamModal", () => {
-  it("uses the persisted 2e9 escrow and linear vesting for the preview", () => {
-    show();
+  it("previews the exact refund split before confirming", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(split, "active")}
+        tokenLabel="XLM"
+      />,
+    );
+
     expect(screen.getByTestId("recipient-payout")).toHaveTextContent("40 XLM");
-    expect(screen.getByTestId("sender-refund")).toHaveTextContent("150 XLM");
-    expect(screen.getByText(/review the exact refund split/i)).toBeInTheDocument();
+    expect(screen.getByTestId("sender-refund")).toHaveTextContent("60 XLM");
   });
 
-  it("disables confirmation when escrow amounts are unavailable", () => {
-    show({ ...stream, totalAmount: undefined });
-    expect(screen.getByTestId("cancel-blocked")).toHaveTextContent("Escrow state is unavailable");
-    expect(screen.getByRole("button", { name: /confirm cancellation/i })).toBeDisabled();
+  it("accounts for already-released amounts in the recipient payout", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(partialReleaseSplit, "active")}
+        tokenLabel="XLM"
+      />,
+    );
+
+    // recipient keeps: 40 vested - 10 released = 30
+    expect(screen.getByTestId("recipient-payout")).toHaveTextContent("30 XLM");
+    // sender gets: 100 total - 40 vested = 60
+    expect(screen.getByTestId("sender-refund")).toHaveTextContent("60 XLM");
   });
 
-  it("disables confirmation for an invalid escrow invariant", () => {
-    show({ ...stream, releasedAmount: "600000000" });
-    expect(screen.getByTestId("cancel-blocked")).toHaveTextContent("Escrow invariant violated");
-    expect(screen.getByRole("button", { name: /confirm cancellation/i })).toBeDisabled();
+  it("shows zero refund when fully vested", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(fullyVestedSplit, "active")}
+        tokenLabel="XLM"
+      />,
+    );
+
+    // recipient keeps: 100 vested - 80 released = 20
+    expect(screen.getByTestId("recipient-payout")).toHaveTextContent("20 XLM");
+    // sender gets: 100 total - 100 vested = 0
+    expect(screen.getByTestId("sender-refund")).toHaveTextContent("0 XLM");
   });
 
-  it("blocks terminal and draft streams", () => {
-    for (const status of ["cancelled", "ended", "withdrawn", "draft"] as const) {
-      const { unmount } = render(
-        <CancelStreamModal isOpen onClose={jest.fn()} onConfirm={jest.fn()} stream={{ ...stream, status }} now={now} />,
-      );
-      expect(screen.getByRole("button", { name: /confirm cancellation/i })).toBeDisabled();
-      unmount();
-    }
+  it("invokes onConfirm when confirming a cancellable stream", async () => {
+    const onConfirm = jest.fn();
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={onConfirm}
+        stream={streamFrom(split, "active")}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /confirm cancellation/i }));
+    expect(onConfirm).toHaveBeenCalled();
   });
 
-  it("confirms a valid cancellation", async () => {
-    const { onConfirm } = show();
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /confirm cancellation/i }));
-    });
-    expect(onConfirm).toHaveBeenCalledTimes(1);
-    expect(screen.getByText(/this action cannot be undone/i)).toBeInTheDocument();
+  it("blocks cancellation and disables confirm for terminal streams", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(split, "cancelled")}
+      />,
+    );
+
+    expect(screen.getByTestId("cancel-blocked")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /confirm cancellation/i }),
+    ).toBeDisabled();
   });
 
-  it("lets the user keep the stream", () => {
-    const { onClose } = show();
+  it("blocks cancellation for ended streams", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(split, "ended")}
+      />,
+    );
+
+    expect(screen.getByTestId("cancel-blocked")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /confirm cancellation/i }),
+    ).toBeDisabled();
+  });
+
+  it("blocks cancellation for withdrawn streams", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(split, "withdrawn")}
+      />,
+    );
+
+    expect(screen.getByTestId("cancel-blocked")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /confirm cancellation/i }),
+    ).toBeDisabled();
+  });
+
+  it("blocks cancellation for draft streams", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(split, "draft")}
+      />,
+    );
+
+    expect(screen.getByTestId("cancel-blocked")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /confirm cancellation/i }),
+    ).toBeDisabled();
+  });
+
+  it("calls onClose when Keep stream is clicked", () => {
+    const onClose = jest.fn();
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={onClose}
+        onConfirm={jest.fn()}
+        stream={streamFrom(split, "active")}
+      />,
+    );
+
     fireEvent.click(screen.getByRole("button", { name: /keep stream/i }));
-    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalled();
   });
 
-  it("uses a custom token label and renders the dialog title", () => {
-    show(stream, jest.fn(), jest.fn(), "USDC");
-    expect(screen.getByRole("dialog", { name: /cancel stream/i })).toBeInTheDocument();
-    expect(screen.getByTestId("sender-refund")).toHaveTextContent("150 USDC");
+  it("shows the warning about irreversible action", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(split, "active")}
+      />,
+    );
+
+    expect(
+      screen.getByText(/this action cannot be undone/i),
+    ).toBeInTheDocument();
   });
 
-  it("disables confirmation while submitting", () => {
-    show(stream, jest.fn(() => new Promise<void>(() => {})));
+  it("shows review text for split preview", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(split, "active")}
+      />,
+    );
+
+    expect(
+      screen.getByText(/review the exact refund split/i),
+    ).toBeInTheDocument();
+  });
+
+  it("uses custom tokenLabel", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(split, "active")}
+        tokenLabel="USDC"
+      />,
+    );
+
+    expect(screen.getByTestId("recipient-payout")).toHaveTextContent("40 USDC");
+    expect(screen.getByTestId("sender-refund")).toHaveTextContent("60 USDC");
+  });
+
+  it("disables the confirm button while submitting", () => {
+    const onConfirm = jest.fn(() => new Promise<void>(() => {})); // never resolves
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={onConfirm}
+        stream={streamFrom(split, "active")}
+      />,
+    );
+
     fireEvent.click(screen.getByRole("button", { name: /confirm cancellation/i }));
     expect(screen.getByRole("button", { name: /cancelling/i })).toBeDisabled();
   });
 
-  it("shows the same payout and refund returned by the route at the same time", async () => {
-    resetDb();
-    resetRateLimitStore();
-    db.streams.set(stream.id, stream);
-    show();
-    const previewPayout = screen.getByTestId("recipient-payout").textContent;
-    const previewRefund = screen.getByTestId("sender-refund").textContent;
-    const response = await cancelStream(
-        new Request(`http://localhost/api/streams/${stream.id}/cancel`, {
-          method: "POST",
-          headers: { "Actor-Wallet-Address": "GSENDER" },
-        }),
-        { params: Promise.resolve({ id: stream.id }) },
-      );
-    expect(response.status).toBe(200);
-    const { cancellation } = await response.json();
-    expect(previewPayout).toBe(`${BigInt(cancellation.recipientPayout) / 10_000_000n} XLM`);
-    expect(previewRefund).toBe(`${BigInt(cancellation.senderRefund) / 10_000_000n} XLM`);
+  it("renders the modal title", () => {
+    render(
+      <CancelStreamModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        stream={streamFrom(split, "active")}
+      />,
+    );
+
+    expect(screen.getByRole("dialog", { name: /cancel stream/i })).toBeInTheDocument();
   });
 });

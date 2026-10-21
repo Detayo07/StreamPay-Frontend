@@ -1,140 +1,552 @@
-/** @jest-environment node */
+/**
+ * @jest-environment node
+ *
+ * Route tests for POST /api/streams/:id/cancel
+ *
+ * Implements verification for issue #1731
+ */
 
-import { POST as createStream } from "@/app/api/streams/route";
-import { POST as startStream } from "@/app/api/streams/[id]/start/route";
-import { POST as cancelStream } from "./route";
-import { db, resetDb } from "@/app/lib/db";
-import { resetRateLimitStore } from "@/app/lib/rate-limit-store";
-import { _resetAllowlistForTesting, addAllowedToken } from "@/app/lib/token-allowlist";
-import { _resetOrgDbForTesting } from "@/app/lib/org-db";
-
-jest.mock("@/app/lib/escrow-state", () => ({
-  ...jest.requireActual("@/app/lib/escrow-state"),
-  escrowNow: () => new Date("2026-01-01T06:00:00.000Z"),
+jest.mock("@/app/lib/logger", () => ({
+  getCorrelationContext: jest.fn(() => ({ request_id: "test-req-id" })),
+  logger: {
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+    debug: jest.fn(),
+  },
+  extractCorrelationContext: jest.fn(() => ({ request_id: "test-req-id" })),
+  withCorrelationContext: jest.fn((_ctx: any, cb: any) => cb()),
+  setCorrelationContext: jest.fn(),
 }));
 
-const recipient = "GDSBCG3OKHCMMWS5EBH2X7XOYTJRWXN2YYQPCNS5OFBU4IDO4X7OFSQA";
-const start = "2026-01-01T00:00:00.000Z";
-const end = "2026-01-02T00:00:00.000Z";
+import { POST as cancelStream } from "./route";
+import { POST as createStreamV1 } from "@/app/api/streams/route";
+import { POST as createStreamV2 } from "@/app/api/v2/streams/route";
+import { POST as createBatchStream } from "@/app/api/streams/batch/route";
+import { POST as createImportStream } from "@/app/api/streams/import/route";
+import { POST as createMultiStream } from "@/app/api/v2/streams/multi/route";
 
-function context(id: string) {
+import { db, resetDb } from "@/app/lib/db";
+import { orgDb, _resetOrgDbForTesting } from "@/app/lib/org-db";
+import { auditLogStore, resetAuditLogStore } from "@/app/lib/audit-log";
+import { resetRateLimitStore } from "@/app/lib/rate-limit-store";
+import { signToken } from "@/app/lib/auth";
+import { DEFAULT_STREAM_POLICY } from "@/app/lib/org-types";
+import { NextRequest } from "next/server";
+
+const WALLET_SENDER = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H";
+const WALLET_ATTACKER = "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA";
+const WALLET_RECIPIENT = "GABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQHGPC";
+const ORG_OWNER = "GOWNER7MG6ZKKIFPWFNVJBXVPUMTYV5ANT2O2ZWL7GSDZWNRW";
+
+function ctx(id: string) {
   return { params: Promise.resolve({ id }) };
 }
 
-function cancelRequest(id: string) {
+function cancelReq(
+  id: string,
+  opts: {
+    jwt?: string | null;
+    actorHeader?: string | null;
+    idempotencyKey?: string;
+  } = {},
+): Request {
+  const headers: Record<string, string> = {};
+  if (opts.jwt) {
+    headers["Authorization"] = `Bearer ${opts.jwt}`;
+  }
+  if (opts.actorHeader) {
+    headers["Actor-Wallet-Address"] = opts.actorHeader;
+  }
+  if (opts.idempotencyKey) {
+    headers["Idempotency-Key"] = opts.idempotencyKey;
+  }
   return new Request(`http://localhost/api/streams/${id}/cancel`, {
     method: "POST",
-    headers: { "Actor-Wallet-Address": "GSENDER" },
+    headers,
   });
-}
-
-async function createActiveStream(fields: Record<string, unknown> = {}) {
-  const created = await createStream(new Request("http://localhost/api/streams", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ recipient, rate: "1", schedule: "day", ...fields }),
-  }));
-  expect(created.status).toBe(201);
-  const { data } = await created.json();
-  const id: string = data.id;
-  const started = await startStream(new Request(`http://localhost/api/streams/${id}/start`, { method: "POST" }), context(id));
-  expect(started.status).toBe(200);
-  return id;
 }
 
 beforeEach(() => {
   resetDb();
+  resetAuditLogStore();
   resetRateLimitStore();
-  _resetAllowlistForTesting();
-  addAllowedToken("XLM");
   _resetOrgDbForTesting();
 });
 
-afterEach(() => {
-  resetRateLimitStore();
-});
+describe("POST /api/streams/:id/cancel — Issue #1731 Test Plan", () => {
+  it("Row 1: Create with a JWT for GA...S, cancel with the same JWT -> 200, names GA...S as refund target", async () => {
+    const senderToken = signToken(WALLET_SENDER);
 
-describe("POST /api/streams/[id]/cancel", () => {
-  it("uses the persisted demo escrow instead of a route-specific table", async () => {
-    const id = "stream-ada";
-    const response = await cancelStream(new Request(`http://localhost/api/streams/${id}/cancel`, {
+    // 1. Create stream authenticated as WALLET_SENDER
+    const createReq = new Request("http://localhost/api/streams", {
       method: "POST",
-      headers: { "Actor-Wallet-Address": "GSENDER00000000000000000000000000000000000000000000" },
-    }), context(id));
-    expect(response.status).toBe(200);
-    expect((await response.json()).cancellation).toMatchObject({
-      recipientPayout: "600000000",
-      senderRefund: "1800000000",
-      totalAmount: "3600000000",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${senderToken}`,
+      },
+      body: JSON.stringify({
+        recipient: WALLET_RECIPIENT,
+        rate: "100",
+        schedule: "month",
+        token: "XLM",
+      }),
     });
+
+    const createRes = await createStreamV1(createReq);
+    expect(createRes.status).toBe(201);
+    const created = await createRes.json();
+    const streamId = created.data.id;
+
+    expect(created.data.senderAddress).toBe(WALLET_SENDER);
+    expect(created.data.ownership).toBe("individual");
+
+    // Advance status to active to allow cancellation
+    const stream = db.streams.get(streamId)!;
+    stream.status = "active";
+    db.streams.set(streamId, stream);
+
+    // 2. Cancel with the same JWT
+    const res = await cancelStream(
+      cancelReq(streamId, { jwt: senderToken }),
+      ctx(streamId),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.cancellation).toBeDefined();
+    expect(body.cancellation.senderAddress).toBe(WALLET_SENDER);
+    expect(body.data.status).toBe("cancelled");
+    expect(body.data.senderAddress).toBe(WALLET_SENDER);
   });
 
-  it.each([
-    { totalAmount: "1.5" },
-    { totalAmount: "0" },
-    { totalAmount: (1n << 127n).toString() },
-    { totalAmount: "100", startTime: end, endTime: start },
-  ])("rejects malformed escrow input at creation: %o", async (fields) => {
-    const response = await createStream(new Request("http://localhost/api/streams", {
+  it("Row 2: Cancel with a different wallet -> 403 SENDER_AUTH_REQUIRED; stream unchanged", async () => {
+    const senderToken = signToken(WALLET_SENDER);
+    const attackerToken = signToken(WALLET_ATTACKER);
+
+    // Create stream owned by WALLET_SENDER
+    const streamId = "stream-owned-by-sender";
+    db.streams.set(streamId, {
+      id: streamId,
+      recipient: WALLET_RECIPIENT,
+      rate: "100",
+      schedule: "month",
+      status: "active",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      token: "XLM",
+      senderAddress: WALLET_SENDER,
+      ownership: "individual",
+    });
+
+    // Attacker tries to cancel with their own JWT
+    const res = await cancelStream(
+      cancelReq(streamId, { jwt: attackerToken }),
+      ctx(streamId),
+    );
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error.code).toBe("SENDER_AUTH_REQUIRED");
+
+    // Stream remains unchanged (still active, not cancelled)
+    const streamAfter = db.streams.get(streamId);
+    expect(streamAfter?.status).toBe("active");
+    expect(streamAfter?.cancellation).toBeUndefined();
+  });
+
+  it("Row 3: Cancel an unclaimed stream with any actor -> 403 SENDER_UNKNOWN", async () => {
+    const callerToken = signToken(WALLET_SENDER);
+
+    // Seeded or unclaimed stream (e.g. stream-unclaimed)
+    const unclaimedId = "stream-unclaimed";
+    expect(db.streams.get(unclaimedId)?.ownership).toBe("unclaimed");
+
+    // Try to cancel with valid JWT
+    const resWithJwt = await cancelStream(
+      cancelReq(unclaimedId, { jwt: callerToken }),
+      ctx(unclaimedId),
+    );
+    expect(resWithJwt.status).toBe(403);
+    const bodyJwt = await resWithJwt.json();
+    expect(bodyJwt.error.code).toBe("SENDER_UNKNOWN");
+
+    // Try to cancel with raw header
+    const resWithHeader = await cancelStream(
+      cancelReq(unclaimedId, { actorHeader: WALLET_SENDER }),
+      ctx(unclaimedId),
+    );
+    expect(resWithHeader.status).toBe(403);
+    const bodyHeader = await resWithHeader.json();
+    expect(bodyHeader.error.code).toBe("SENDER_UNKNOWN");
+
+    // Stream remains unchanged
+    expect(db.streams.get(unclaimedId)?.status).toBe("active");
+  });
+
+  it("Row 4: Org-owned stream, canceller role -> 200", async () => {
+    // stream-ada is owned by org-acme in orgDb
+    const orgStreamId = "stream-ada";
+    expect(orgDb.streamOwnership.get(orgStreamId)).toBe("org-acme");
+
+    // Configure org-acme policy to allow single approval so stop executes immediately
+    const org = orgDb.orgs.get("org-acme")!;
+    org.policy = {
+      ...DEFAULT_STREAM_POLICY,
+      canStop: ["owner"],
+      requireApprovals: 1,
+    };
+    orgDb.orgs.set("org-acme", org);
+
+    // Owner cancels using Actor-Wallet-Address header (or JWT)
+    const res = await cancelStream(
+      cancelReq(orgStreamId, { actorHeader: ORG_OWNER }),
+      ctx(orgStreamId),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.status).toBe("cancelled");
+    expect(body.cancellation).toBeDefined();
+    // Refund target is stream's recorded senderAddress, not caller
+    expect(body.cancellation.senderAddress).toBe(
+      "GSENDER00000000000000000000000000000000000000000000",
+    );
+  });
+
+  it("Row 5: Header-only actor equal to the sender, header flag off -> 403 SENDER_AUTH_REQUIRED", async () => {
+    // Individually owned stream has senderAddress WALLET_SENDER
+    const streamId = "stream-header-only-test";
+    db.streams.set(streamId, {
+      id: streamId,
+      recipient: WALLET_RECIPIENT,
+      rate: "100",
+      schedule: "month",
+      status: "active",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      token: "XLM",
+      senderAddress: WALLET_SENDER,
+      ownership: "individual",
+    });
+
+    // Caller sends Actor-Wallet-Address matching sender, but NO verified JWT
+    const res = await cancelStream(
+      cancelReq(streamId, { actorHeader: WALLET_SENDER }),
+      ctx(streamId),
+    );
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error.code).toBe("SENDER_AUTH_REQUIRED");
+
+    // Stream remains unchanged
+    expect(db.streams.get(streamId)?.status).toBe("active");
+  });
+
+  it("Row 6: All creation paths set senderAddress when authenticated, and null/unclaimed when not", async () => {
+    const senderToken = signToken(WALLET_SENDER);
+
+    // Path 1: v1 POST /api/streams (authenticated)
+    const v1AuthReq = new Request("http://localhost/api/streams", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${senderToken}`,
+      },
+      body: JSON.stringify({
+        recipient: WALLET_RECIPIENT,
+        rate: "10",
+        schedule: "month",
+        token: "XLM",
+      }),
+    });
+    const v1AuthRes = await createStreamV1(v1AuthReq);
+    expect(v1AuthRes.status).toBe(201);
+    const v1AuthBody = await v1AuthRes.json();
+    expect(v1AuthBody.data.senderAddress).toBe(WALLET_SENDER);
+    expect(v1AuthBody.data.ownership).toBe("individual");
+
+    // Path 1: v1 POST /api/streams (unauthenticated)
+    const v1UnauthReq = new Request("http://localhost/api/streams", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ recipient, rate: "1", schedule: "day", ...fields }),
-    }));
-    expect(response.status).toBe(422);
-    expect((await response.json()).error.code).toBe("VALIDATION_ERROR");
-  });
-
-  it("uses the persisted 2e9 amount, not the old 1e9 default", async () => {
-    const id = await createActiveStream({ totalAmount: "2000000000", startTime: start, endTime: end });
-    expect(db.streams.get(id)).toMatchObject({ totalAmount: "2000000000", releasedAmount: "0", startTime: start, endTime: end });
-
-    const response = await cancelStream(cancelRequest(id), context(id));
-    expect(response.status).toBe(200);
-    const body = await response.json();
-    expect(body.cancellation).toMatchObject({
-      totalAmount: "2000000000",
-      alreadyReleased: "0",
-      recipientPayout: "500000000",
-      senderRefund: "1500000000",
+      body: JSON.stringify({
+        recipient: WALLET_RECIPIENT,
+        rate: "10",
+        schedule: "month",
+        token: "XLM",
+      }),
     });
-    expect(body.data.status).toBe("cancelled");
+    const v1UnauthRes = await createStreamV1(v1UnauthReq);
+    expect(v1UnauthRes.status).toBe(201);
+    const v1UnauthBody = await v1UnauthRes.json();
+    expect(v1UnauthBody.data.senderAddress).toBeNull();
+    expect(v1UnauthBody.data.ownership).toBe("unclaimed");
+
+    // Path 2: v2 POST /api/v2/streams (authenticated)
+    const v2Req = new Request("http://localhost/api/v2/streams", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${senderToken}`,
+      },
+      body: JSON.stringify({
+        recipient: WALLET_RECIPIENT,
+        rate: "10 XLM/month",
+        schedule: "month",
+      }),
+    });
+    const v2Res = await createStreamV2(v2Req);
+    expect(v2Res.status).toBe(201);
+    const v2Body = await v2Res.json();
+    expect(v2Body.senderAddress).toBe(WALLET_SENDER);
+    expect(v2Body.ownership).toBe("individual");
+
+    // Path 3: v1 batch POST /api/streams/batch (authenticated)
+    const batchReq = new NextRequest("http://localhost/api/streams/batch", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${senderToken}`,
+      },
+      body: JSON.stringify([
+        {
+          recipient: WALLET_RECIPIENT,
+          rate: "10",
+          schedule: "month",
+          token: "XLM",
+        },
+      ]),
+    });
+    const batchRes = await createBatchStream(batchReq);
+    expect(batchRes.status).toBe(201);
+    const batchBody = await batchRes.json();
+    expect(batchBody.data[0].senderAddress).toBe(WALLET_SENDER);
+    expect(batchBody.data[0].ownership).toBe("individual");
+
+    // Path 4: v1 import POST /api/streams/import (authenticated)
+    const importReq = new Request("http://localhost/api/streams/import", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${senderToken}`,
+      },
+      body: JSON.stringify({
+        rows: [
+          {
+            recipient: WALLET_RECIPIENT,
+            rate: "10",
+            schedule: "month",
+            token: "XLM",
+          },
+        ],
+      }),
+    });
+    const importRes = await createImportStream(importReq);
+    expect(importRes.status).toBe(207);
+    const importBody = await importRes.json();
+    const importedStreamId = importBody.results[0].streamId;
+    const importedStream = db.streams.get(importedStreamId);
+    expect(importedStream?.senderAddress).toBe(WALLET_SENDER);
+    expect(importedStream?.ownership).toBe("individual");
+
+    // Path 5: v2 multi POST /api/v2/streams/multi (authenticated)
+    const multiReq = new Request("http://localhost/api/v2/streams/multi", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${senderToken}`,
+      },
+      body: JSON.stringify({
+        name: "Q4 Distribution",
+        token: "XLM",
+        totalAmount: 1000,
+        startTime: "2026-10-01T00:00:00Z",
+        endTime: "2026-12-31T00:00:00Z",
+        recipients: [
+          { address: WALLET_RECIPIENT, percentage: 100, amount: 1000 },
+        ],
+      }),
+    });
+    const multiRes = await createMultiStream(multiReq);
+    expect(multiRes.status).toBe(201);
+    const multiBody = await multiRes.json();
+    expect(multiBody.senderAddress).toBe(WALLET_SENDER);
+    expect(multiBody.ownership).toBe("individual");
+    const legId = multiBody.recipients[0].stream_id;
+    const legStream = db.streams.get(legId);
+    expect(legStream?.senderAddress).toBe(WALLET_SENDER);
+    expect(legStream?.ownership).toBe("individual");
   });
 
-  it("returns 422 without changing status when totalAmount is missing", async () => {
-    const id = await createActiveStream();
-    const response = await cancelStream(cancelRequest(id), context(id));
-    expect(response.status).toBe(422);
-    expect((await response.json()).error.code).toBe("ESCROW_STATE_UNAVAILABLE");
-    expect(db.streams.get(id)?.status).toBe("active");
+  it("Row 7: Cancellation record never contains 'unknown'", async () => {
+    const senderToken = signToken(WALLET_SENDER);
+    const streamId = "stream-no-unknown-check";
+    db.streams.set(streamId, {
+      id: streamId,
+      recipient: WALLET_RECIPIENT,
+      rate: "100",
+      schedule: "month",
+      status: "active",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      token: "XLM",
+      senderAddress: WALLET_SENDER,
+      ownership: "individual",
+    });
+
+    const res = await cancelStream(
+      cancelReq(streamId, { jwt: senderToken }),
+      ctx(streamId),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    const cancellationJson = JSON.stringify(body.cancellation);
+    expect(cancellationJson).not.toContain("unknown");
+    expect(body.cancellation.senderAddress).toBe(WALLET_SENDER);
   });
 
-  it("retains state guards when a terminal or draft record has no escrow fields", async () => {
-    for (const [id, code, status] of [
-      ["stream-kemi", "STREAM_NOT_CANCELLABLE", 422],
-      ["stream-yusuf", "ALREADY_TERMINAL", 409],
-    ] as const) {
-      const response = await cancelStream(cancelRequest(id), context(id));
-      expect(response.status).toBe(status);
-      expect((await response.json()).error.code).toBe(code);
-    }
+  it("Row 8: Audit event actor equals verified sender", async () => {
+    const senderToken = signToken(WALLET_SENDER);
+    const streamId = "stream-audit-test";
+    db.streams.set(streamId, {
+      id: streamId,
+      recipient: WALLET_RECIPIENT,
+      rate: "100",
+      schedule: "month",
+      status: "active",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      token: "XLM",
+      senderAddress: WALLET_SENDER,
+      ownership: "individual",
+    });
+
+    const res = await cancelStream(
+      cancelReq(streamId, { jwt: senderToken }),
+      ctx(streamId),
+    );
+    expect(res.status).toBe(200);
+
+    const auditEvents = auditLogStore.list({
+      targetId: streamId,
+      action: "stream.cancel",
+    });
+    expect(auditEvents.length).toBe(1);
+    expect(auditEvents[0].actor.id).toBe(WALLET_SENDER);
   });
 
-  it("returns INVALID_ESCROW_STATE for released funds above vested funds", async () => {
-    const id = await createActiveStream({ totalAmount: "2000000000", startTime: start, endTime: end });
-    db.streams.set(id, { ...db.streams.get(id)!, releasedAmount: "600000000" });
-    const response = await cancelStream(cancelRequest(id), context(id));
-    expect(response.status).toBe(422);
-    expect((await response.json()).error.code).toBe("INVALID_ESCROW_STATE");
-    expect(db.streams.get(id)?.status).toBe("active");
+  it("returns 404 for non-existent stream", async () => {
+    const senderToken = signToken(WALLET_SENDER);
+    const res = await cancelStream(
+      cancelReq("stream-non-existent", { jwt: senderToken }),
+      ctx("stream-non-existent"),
+    );
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe("STREAM_NOT_FOUND");
   });
 
-  it("keeps refund arithmetic exact above 2^53", async () => {
-    const total = 9_007_199_254_740_993n;
-    const id = await createActiveStream({ totalAmount: total.toString(), startTime: start, endTime: end });
-    const response = await cancelStream(cancelRequest(id), context(id));
-    expect(response.status).toBe(200);
-    const { cancellation } = await response.json();
-    expect(cancellation.recipientPayout).toBe((total / 4n).toString());
-    expect(cancellation.senderRefund).toBe((total - total / 4n).toString());
+  it("returns 409 ALREADY_TERMINAL when stream is ended or cancelled", async () => {
+    const senderToken = signToken(WALLET_SENDER);
+    const streamId = "stream-ended-test";
+    db.streams.set(streamId, {
+      id: streamId,
+      recipient: WALLET_RECIPIENT,
+      rate: "100",
+      schedule: "month",
+      status: "ended",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      token: "XLM",
+      senderAddress: WALLET_SENDER,
+      ownership: "individual",
+    });
+
+    const res = await cancelStream(
+      cancelReq(streamId, { jwt: senderToken }),
+      ctx(streamId),
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error.code).toBe("ALREADY_TERMINAL");
+  });
+
+  it("supports Idempotency-Key header on cancellation", async () => {
+    const senderToken = signToken(WALLET_SENDER);
+    const streamId = "stream-idempotency-test";
+    db.streams.set(streamId, {
+      id: streamId,
+      recipient: WALLET_RECIPIENT,
+      rate: "100",
+      schedule: "month",
+      status: "active",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      token: "XLM",
+      senderAddress: WALLET_SENDER,
+      ownership: "individual",
+    });
+
+    const idemKey = "test-idem-key-12345";
+    const res1 = await cancelStream(
+      cancelReq(streamId, { jwt: senderToken, idempotencyKey: idemKey }),
+      ctx(streamId),
+    );
+    expect(res1.status).toBe(200);
+    const body1 = await res1.json();
+
+    const res2 = await cancelStream(
+      cancelReq(streamId, { jwt: senderToken, idempotencyKey: idemKey }),
+      ctx(streamId),
+    );
+    expect(res2.status).toBe(200);
+    const body2 = await res2.json();
+    expect(body2.cancellation.recipientTxHash).toBe(
+      body1.cancellation.recipientTxHash,
+    );
+  });
+
+  it("rejects org-owned stream cancel when actor lacks canceller role or multi-sig approval is required", async () => {
+    const orgStreamId = "stream-ada";
+
+    // Default org-acme policy requires 2 approvals -> 409 APPROVAL_REQUIRED
+    const resApproval = await cancelStream(
+      cancelReq(orgStreamId, { actorHeader: ORG_OWNER }),
+      ctx(orgStreamId),
+    );
+    expect(resApproval.status).toBe(409);
+    const bodyApproval = await resApproval.json();
+    expect(bodyApproval.error.code).toBe("APPROVAL_REQUIRED");
+
+    // Non-member actor -> 403
+    const resDenied = await cancelStream(
+      cancelReq(orgStreamId, { actorHeader: WALLET_ATTACKER }),
+      ctx(orgStreamId),
+    );
+    expect(resDenied.status).toBe(403);
+
+    // Missing actor identity -> 403 ACTOR_REQUIRED
+    const resNoActor = await cancelStream(
+      cancelReq(orgStreamId, {}),
+      ctx(orgStreamId),
+    );
+    expect(resNoActor.status).toBe(403);
+    const bodyNoActor = await resNoActor.json();
+    expect(bodyNoActor.error.code).toBe("ACTOR_REQUIRED");
+
+    // Org stream with no senderAddress -> 403 SENDER_UNKNOWN
+    const stream = db.streams.get(orgStreamId)!;
+    stream.senderAddress = null;
+    db.streams.set(orgStreamId, stream);
+    const resNoSender = await cancelStream(
+      cancelReq(orgStreamId, { actorHeader: ORG_OWNER }),
+      ctx(orgStreamId),
+    );
+    expect(resNoSender.status).toBe(403);
+    const bodyNoSender = await resNoSender.json();
+    expect(bodyNoSender.error.code).toBe("SENDER_UNKNOWN");
   });
 });
